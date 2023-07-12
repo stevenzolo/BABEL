@@ -1,15 +1,18 @@
 # System
 babel-env
+venv38
 
 # Temp files
 *.DS_Store
 *.swp
+*.idea
 __pycache__
 notebooks/.ipynb_checkpoints
           	
 # Data    	
 data/babel_v1.0_release
 action_recognition/data/release
+AMASS_Data
 
 # Predictions
 action_recognition/challenge/*.pkl
