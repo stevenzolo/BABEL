@@ -10,7 +10,7 @@ __pycache__
 notebooks/.ipynb_checkpoints
           	
 # Data    	
-data/babel_v1.0_release
+babel_v1.0_release
 action_recognition/data/release
 AMASS_Data
 

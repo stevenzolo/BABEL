@@ -6,6 +6,7 @@ Author@Weichao
 Created on Jul. 8th, 2023
 """
 import os
+import json
 import numpy as np
 from copy import deepcopy
 from numpy.linalg import norm
@@ -38,6 +39,32 @@ class JointAngle:
             return quat.axangle2quat(vec, angle_norm)
         else:
             return np.array([1., 0., 0., 0.])
+
+
+class MovementSegment:
+    def __init__(self, belong_to_mocap, start_stamp, end_stamp, movement_label):
+        self.belong_to_mocap = belong_to_mocap
+        self.label = movement_label
+        if os.path.exists(belong_to_mocap):
+            self.pose = self.attached_data(start_stamp, end_stamp)
+        else:
+            self.pose = None
+
+    def attached_data(self, start_stamp, end_stamp):
+        # first 22 joints correspond to body, the remained 30 ones belong to fingers
+        npz_data = np.load(self.belong_to_mocap)
+        framerate = int(npz_data['mocap_framerate'])
+        # get 60 fps data
+        if framerate == 120:
+            step = 2
+        elif framerate == 60 or framerate == 59:
+            step = 1
+        else:
+            raise ValueError("Undefined frame rate")
+        data_pose = npz_data['poses'][::step].astype(np.float32)
+        # data_pose = npz_data['poses'][:10].astype(np.float32)   # for test
+        # data_trans = npz_data['trans'][::step].astype(np.float32)
+        return data_pose[int(60 * start_stamp): int(60 * end_stamp), :22 * 3]  # first 22 joints belong to body
 
 
 class AmassClip:
@@ -167,27 +194,78 @@ class AngleCluster:
         return self.angle_name
 
 
-def cluster_angles_over_train_files(amass_file_folder):
-    amass_joint_order_lst = [
-        'left_hip', 'right_hip', 'waist', 'left_knee', 'right_knee', 'spine', 'left_ankle', 'right_ankle',
-        'spine1', 'left_toe', 'right_toe', 'spine2', 'left_clavicle', 'right_clavicle', 'neck', 'head',
-        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'
-    ]
-    angle_type_lst = ['rotation', 'extension', 'abduction']
-    angle_cluster_order_lst = []
-    joint_angle_order_lst = []
-    for joint in amass_joint_order_lst:
-        for joint_comp in angle_type_lst:
-            angle_name = '_'.join([joint, joint_comp])
-            angle_cluster_order_lst.append(AngleCluster(angle_name))
-            joint_angle_order_lst.append(JointAngle(angle_name))
+def extract_movement_segments(data_local_dir, annotation_file_path):
+    # Read annotation files and corresponding 'amass' pose data, extract and collect movement clips
+    movement_segment_collection = dict()
+    with open(annotation_file_path, 'r') as btj:
+        annotation_train = json.load(btj)
+    pose_attach_stats = []
+    for amass_id in annotation_train:
+        mocap_path = annotation_train[amass_id]["feat_p"]
+        if annotation_train[amass_id]["frame_ann"] is None:  # example: 4887,
+            continue
+        frame_ann_labels = annotation_train[amass_id]["frame_ann"]["labels"]
+        for label in frame_ann_labels:
+            if len(label["act_cat"]) == 1:
+                movement_label = label["act_cat"][0]
+            else:
+                movement_label = '_'.join(label["act_cat"])
+            movement_segment = MovementSegment(
+                    belong_to_mocap=os.path.join(data_local_dir, mocap_path),
+                    start_stamp=label["start_t"],
+                    end_stamp=label["end_t"],
+                    movement_label=label["act_cat"]
+                )
+            if movement_segment.pose is not None:
+                if movement_label in movement_segment_collection:
+                    movement_segment_collection[movement_label].append(movement_segment)
+                else:
+                    movement_segment_collection[movement_label] = [movement_segment]
+                pose_attach_stats.append(1)
+            else:
+                pose_attach_stats.append(0)
 
+    print("Attach {}/{} pose data of annotated segments".format(sum(pose_attach_stats), len(pose_attach_stats)))
+    return movement_segment_collection
+
+
+def detect_angle_changes_over_train(movement_segments_collection: dict, undetected_change=0.1):
+    angle_changes_collection = dict()
+    for movement_label in movement_segments_collection:
+        angle_changes_lst_in_movement = [[] for _ in range(len(joint_angle_order_lst))]
+        for movement in movement_segments_collection[movement_label]:
+            for angle_ix in range(len(joint_angle_order_lst)):
+                angle_val_change = movement.pose[:, angle_ix].max() - movement.pose[:, angle_ix].min()
+                angle_changes_lst_in_movement[angle_ix].append(angle_val_change)
+        angle_changes_mean = [np.mean(angle_changes_lst) for angle_changes_lst in angle_changes_lst_in_movement]
+
+        for angle_ix, joint_angle in enumerate(joint_angle_order_lst):
+            if angle_changes_mean[angle_ix] > undetected_change:  # todo, plus variance?
+                # all people have big change in this angle when doing movement
+                min_change = min(angle_changes_lst_in_movement[angle_ix])
+                if joint_angle.name in angle_changes_collection:
+                    angle_changes_collection[joint_angle.name].append(min_change)
+                else:
+                    angle_changes_collection[joint_angle.name] = [min_change]
+
+    min_angle_change_detection = {}
+    for angle_name_, changes_in_movements in angle_changes_collection.items():
+        # detect possible changes in all related movements
+        min_angle_change_detection[angle_name_] = min(changes_in_movements)
+    return min_angle_change_detection
+
+
+def cluster_angles_over_train_files(data_local_dir, rdp_epsilon):
     amass_clip_lst = []
-    for file_name in os.listdir(amass_file_folder):
-        # file_name = 'D7 - walk to bow_poses.npz'  # example
-        file_path = os.path.join(file_folder, file_name)
+    amass_mocap_path_lst = []
+    for cur_path, directories, file_names in os.walk(os.path.join(data_local_dir, 'AMASS_Data')):
+        for file_name in file_names:
+            if file_name.split('.')[-1] == 'npz':
+                amass_mocap_path_lst.append(os.path.join(cur_path, file_name))
+
+    for file_path in amass_mocap_path_lst:
         amass_clip = AmassClip(data_path=file_path, angle_order_lst=deepcopy(joint_angle_order_lst))
-        amass_clip.segment_joint_angle_frms()
+        amass_clip.segment_joint_angle_frms()   # todo, better epsilon
         # amass_file.visualize_segmentation()
         amass_clip_lst.append(amass_clip)
         for angle_ix, angle in enumerate(amass_clip.angle_order_lst):
@@ -229,13 +307,30 @@ def generate_cluster_primitives_data(amass_clip_lst: [AmassClip]):
 
 
 if __name__ == "__main__":
-    file_folder = os.path.join(
-        os.getcwd(), 'AMASS_Data', 'ACCAD', 'ACCAD', 'Male1Running_c3d'
-        # Male2MartialArtsExtended_c3d, Male1Running_c3d
+    local_dir = os.path.join(os.getcwd(), 'AMASS_Data')
+    amass_joint_order_lst = [
+        'left_hip', 'right_hip', 'waist', 'left_knee', 'right_knee', 'spine', 'left_ankle', 'right_ankle',
+        'spine1', 'left_toe', 'right_toe', 'spine2', 'left_clavicle', 'right_clavicle', 'neck', 'head',
+        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'
+    ]
+    angle_type_lst = ['rotation', 'extension', 'abduction']
+    angle_cluster_order_lst = []
+    joint_angle_order_lst = []
+    for joint in amass_joint_order_lst:
+        for joint_comp in angle_type_lst:
+            angle_name = '_'.join([joint, joint_comp])
+            angle_cluster_order_lst.append(AngleCluster(angle_name))
+            joint_angle_order_lst.append(JointAngle(angle_name))
+
+    annotation_train_path = os.path.join(os.getcwd(), 'babel_v1.0_release', 'train.json')
+    movement_segment_dict = extract_movement_segments(
+        data_local_dir=local_dir,
+        annotation_file_path=annotation_train_path
     )
-    generate_cluster_primitives_data(
-        cluster_angles_over_train_files(file_folder)
-    )
+    angle_clip_base = detect_angle_changes_over_train(movement_segment_dict)
+    cluster_angles_over_train_files(local_dir, angle_clip_base)
+
+
 
 
 
