@@ -9,8 +9,10 @@ venv38
 __pycache__
 notebooks/.ipynb_checkpoints
           	
-# Data    	
-babel_v1.0_release
+# Data
+data/amass/
+    	
+data/babel_v1.0_release
 action_recognition/data/release
 AMASS_Data
 

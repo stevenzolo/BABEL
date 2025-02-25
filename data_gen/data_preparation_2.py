@@ -3,7 +3,10 @@ Read pose/annotation training data, and extract action clip from continuous moti
 """
 import os
 import json
+import pickle
 import numpy as np
+from scipy.interpolate import interp1d
+from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 
 from utils import JOINT_ANGLE_ORDER_LST
@@ -20,41 +23,37 @@ class MovementSegment:
         else:
             self.pose = None
 
-    def attached_data(self, start_stamp, end_stamp):
+    def attached_data(self, start_stamp, end_stamp, normal_fps=60):
         # first 22 joints correspond to body, the remained 30 ones belong to fingers
         npz_data = np.load(self.belong_to_mocap)
-        framerate = int(npz_data['mocap_framerate'])
+        ori_fps = int(npz_data['mocap_framerate'])
         # get 60 fps data
-        if framerate == 120:
-            step = 2
-        elif framerate == 60 or framerate == 59:
-            step = 1
-        else:
-            raise ValueError("Undefined frame rate")
-        data_pose = npz_data['poses'][::step].astype(np.float32)
-        # data_pose = npz_data['poses'][:10].astype(np.float32)   # for test
-        # data_trans = npz_data['trans'][::step].astype(np.float32)
-        return data_pose[int(60 * start_stamp): int(60 * end_stamp), :22 * 3]  # first 22 joints belong to body
+        ori_num_frames = len(npz_data['poses'])
+        interp_func = interp1d(
+            np.linspace(1, ori_num_frames, ori_num_frames), npz_data['poses'].astype(np.float32),
+            axis=0, kind='nearest'
+        )
+        sampled_num_frms = int(ori_num_frames * (normal_fps / ori_fps))
+        sampled_pose_data = interp_func(np.linspace(1, ori_num_frames, sampled_num_frms))
+        return sampled_pose_data[int(normal_fps * start_stamp): int(normal_fps * end_stamp), :22 * 3]
 
 
-def extract_movement_segments(data_local_dir, annotation_file_path):
+def extract_movement_segments(data_local_dir, annotation_file_path, save_pkl_path=None):
     # Read annotation files and corresponding 'amass' pose data, extract and collect movement clips
-    movement_segment_collection = dict()
-    with open(annotation_file_path, 'r') as btj:
-        annotation_train = json.load(btj)
     pose_attach_stats = []
-    for amass_id in annotation_train:
-        mocap_path = annotation_train[amass_id]["feat_p"]
-        if annotation_train[amass_id]["frame_ann"] is None:  # example: 4887,
-            continue
-        frame_ann_labels = annotation_train[amass_id]["frame_ann"]["labels"]
+
+    def _attach_single_file(_ann_amass_file):
+        mocap_path = _ann_amass_file["feat_p"]
+        if _ann_amass_file["frame_ann"] is None:  # example: 4887,
+            return
+        frame_ann_labels = _ann_amass_file["frame_ann"]["labels"]
         for label in frame_ann_labels:
             movement_segment = MovementSegment(
-                    belong_to_mocap=os.path.join(data_local_dir, mocap_path),
-                    start_stamp=label["start_t"],
-                    end_stamp=label["end_t"],
-                    movement_labels=label["act_cat"]
-                )
+                belong_to_mocap=os.path.join(data_local_dir, mocap_path),
+                start_stamp=label["start_t"],
+                end_stamp=label["end_t"],
+                movement_labels=label["act_cat"]
+            )
             if movement_segment.pose is not None:
                 for movement_lbl in movement_segment.labels:
                     if movement_lbl in movement_segment_collection:
@@ -64,8 +63,28 @@ def extract_movement_segments(data_local_dir, annotation_file_path):
                 pose_attach_stats.append(1)
             else:
                 pose_attach_stats.append(0)
+                pass
+        return
+
+    movement_segment_collection = dict()
+    with open(annotation_file_path, 'r') as btj:
+        annotation_files = json.load(btj)
+
+    # single_cpu_start = time.time()
+    for amass_id in annotation_files:
+        _attach_single_file(annotation_files[amass_id])
+    # single_cpu_end = time.time()
+    # print("Single CPU spends time of {}".format((single_cpu_end - single_cpu_start)/60))
+
+    # mul_cpu_start = time.time()
+    # Parallel(n_jobs=4)(delayed(_attach_single_file)(ann_amass) for ann_amass in annotation_files.values())
+    # mul_cpu_end = time.time()
+    # print("Multiple CPU spends time of {}".format((mul_cpu_end - mul_cpu_start) / 60))
 
     print("Attach {}/{} pose data of annotated segments".format(sum(pose_attach_stats), len(pose_attach_stats)))
+    if save_pkl_path is not None:
+        with open(save_pkl_path, 'wb') as sjp:
+            pickle.dump(movement_segment_collection, sjp)
     return movement_segment_collection
 
 
@@ -109,7 +128,7 @@ def visualize_angle_arr_in_movements(movement_segments_collection: dict):
 
 if __name__ == "__main__":
     local_dir = os.path.join(os.getcwd(), 'AMASS_Data')
-    annotation_train_path = os.path.join(os.getcwd(), 'babel_v1.0_release', 'train.json')
+    annotation_train_path = os.path.join(os.getcwd(), 'data', 'babel_v1.0_release', 'train.json')
     movement_segment_dict = extract_movement_segments(
         data_local_dir=local_dir,
         annotation_file_path=annotation_train_path
